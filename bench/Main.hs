@@ -4,6 +4,7 @@
 {-# LANGUAGE TypeFamilies #-}
 module Main where
 
+import Control.Monad.Ref
 import Data.Functor.Misc
 import Control.Monad.Primitive
 import Control.Monad.IO.Class
@@ -17,6 +18,7 @@ import Control.Exception (evaluate)
 import Control.Monad
 import Reflex
 import Reflex.Host.Class
+import Reflex.Brain
 import System.Mem
 import System.IO
 import Criterion.Main
@@ -28,7 +30,9 @@ import qualified Data.Dependent.Map as DM
 
 main :: IO ()
 main = defaultMain
-  [ bgroup "micro" micros ]
+  [ bgroup "Spider" microsSpider
+  , bgroup "Brain"  microsBrain
+  ]
 
 instance NFData (IORef a) where
   rnf x = seq x ()
@@ -48,9 +52,12 @@ withSetupWHNF :: String -> SpiderHost a -> (a -> SpiderHost b) -> Benchmark
 withSetupWHNF name setup action = env (WHNF <$> runSpiderHost setup) $ \ ~(WHNF a) ->
   bench name . whnfIO $ runSpiderHost (action a)
 
+withSetupHeadWHNF :: String -> Head a -> (a -> Head b) -> Benchmark
+withSetupHeadWHNF name setup action = env (WHNF <$> runHead setup) $ \ ~(WHNF a) ->
+  bench name . whnfIO $ runHead (action a)
 
-micros :: [Benchmark]
-micros =
+microsSpider :: [Benchmark]
+microsSpider =
   [ bench "newIORef" $ whnfIO $ void $ newIORef ()
   , env (newIORef (42 :: Int)) (bench "readIORef" . whnfIO . readIORef)
   , bench "newTVar" $ whnfIO $ void $ newTVarIO ()
@@ -88,23 +95,79 @@ micros =
     (\(subd, t:riggers) -> do
         Just key <- liftIO $ readIORef t
         fireEvents [key :=> (42 :: Int)])
-  , withSetupWHNF "hold" newEventWithTriggerRef $ \(ev,trigger) -> hold (42 :: Int) ev
-  , withSetupWHNF "sample" (newEventWithTriggerRef >>= hold (42 :: Int) . fst) sample    
+  , withSetupWHNF "hold"
+    (do (ev,_) <- newEventWithTriggerRef
+        subscribeEvent ev
+        return ev) $
+     hold (42 :: Int)
+  , withSetupWHNF "sample"
+    (do (ev,_) <- newEventWithTriggerRef
+        subscribeEvent ev
+        hold (42 :: Int) ev)
+    sample    
   ]
 
-setupMerge :: Int
-           -> SpiderHost (Event Spider (DM.DMap (Const2 Int a)),
-                         [IORef (Maybe (EventTrigger Spider a))])
+microsBrain :: [Benchmark]
+microsBrain =
+  [ bench "newEventWithTrigger" $ whnfIO . void $ runHead $ newEventWithTrigger $
+      \trigger -> return () <$ evaluate trigger
+  , bench "newEventWithTriggerRef" $ whnfIO . void $ runHead newEventWithTriggerRef
+  , withSetupHeadWHNF "subscribeEvent" newEventWithTriggerRef $ subscribeEvent . fst
+  , withSetupHeadWHNF "subscribeMerge(1)" (setupMerge 1) $ \(ev,_) -> subscribeEvent ev
+  , withSetupHeadWHNF "subscribeMerge(100)" (setupMerge 100) (subscribeEvent . fst)
+  , withSetupHeadWHNF "subscribeMerge(10000)" (setupMerge 10000) (subscribeEvent . fst)
+  , withSetupHeadWHNF "fireEventsAndRead(single/single)"
+    (newEventWithTriggerRef >>= subscribePair)
+    (\(subd, trigger) -> fireAndRead trigger (42 :: Int) subd)
+  , withSetupHeadWHNF "fireEventsOnly"
+    (newEventWithTriggerRef >>= subscribePair)
+    (\(subd, trigger) -> do
+        Just key <- liftIO $ readIORef trigger
+        fireEvents [key :=> (42 :: Int)])
+  , withSetupHeadWHNF "fireEventsAndRead(head/merge1)"
+    (setupMerge 1 >>= subscribePair)
+    (\(subd, t:riggers) -> fireAndRead t (42 :: Int) subd)
+  , withSetupHeadWHNF "fireEventsAndRead(head/merge100)"
+    (setupMerge 100 >>= subscribePair)
+    (\(subd, t:riggers) -> fireAndRead t (42 :: Int) subd)
+  , withSetupHeadWHNF "fireEventsAndRead(head/merge10000)"
+      (setupMerge 10000 >>= subscribePair)
+      (\(subd, t:riggers) -> fireAndRead t (42 :: Int) subd)
+  , withSetupHeadWHNF "fireEventsOnly(head/merge100)"
+    (setupMerge 100 >>= subscribePair)
+    (\(subd, t:riggers) -> do
+        Just key <- liftIO $ readIORef t
+        fireEvents [key :=> (42 :: Int)])
+  , withSetupHeadWHNF "hold"
+    (do (ev,_) <- newEventWithTriggerRef
+        subscribeEvent ev
+        runPropagateHead $ eventPush ev) $
+     liftIO . holdPush (42 :: Int)
+  , withSetupHeadWHNF "sample"
+    (do (ev,_) <- newEventWithTriggerRef
+        subscribeEvent ev
+        r <- hold (42 :: Int) ev
+        r <$ sample r)
+    sample    
+  ]
+
+{-# INLINE setupMerge #-}
+setupMerge :: (Reflex t, MonadReflexHost t m, Ref m ~ Ref IO, Functor m, MonadRef m) => Int
+           -> m (Event t (DM.DMap (Const2 Int a)),
+                [IORef (Maybe (EventTrigger t a))])
 setupMerge num = do
   (evs, triggers) <- unzip <$> replicateM 100 newEventWithTriggerRef
   let !m = DM.fromList [WrapArg (Const2 i) :=> v | (i,v) <- zip [0..] evs]
-  pure (merge m, triggers)
+  return (merge m, triggers)
 
-subscribePair :: (Event Spider a, b) -> SpiderHost (EventHandle Spider a, b)
+{-# INLINE subscribePair #-}
+subscribePair :: (Reflex t, MonadReflexHost t m, Functor m) => (Event t a, b) -> m (EventHandle t a, b)
 subscribePair (ev, b) = (,b) <$> subscribeEvent ev
 
-fireAndRead :: IORef (Maybe (EventTrigger Spider a)) -> a -> EventHandle Spider b
-            -> SpiderHost (Maybe b)
+
+{-# INLINE fireAndRead #-}
+fireAndRead :: (MonadRef m, MonadReflexHost t m) => Ref m (Maybe (EventTrigger t a)) -> a
+            -> EventHandle t b -> m (Maybe b)
 fireAndRead trigger val subd = do
-  Just key <- liftIO $ readIORef trigger
+  Just key <- readRef trigger
   fireEventsAndRead [key :=> val] $ readEvent subd >>= T.sequence

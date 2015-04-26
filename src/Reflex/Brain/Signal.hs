@@ -1,4 +1,14 @@
-module Reflex.Brain.Signal where
+{-# LANGUAGE RankNTypes #-}
+module Reflex.Brain.Signal
+ ( Signal()
+ , signalEmit
+ , signalConnect
+ , signalPrune
+ , signalReset
+ , signalNever
+ , signalCreate
+ )
+ where
 
 import Data.Maybe
 import System.Mem.Weak
@@ -9,36 +19,41 @@ import Control.Applicative
 
 import qualified Data.Foldable as F
 
-data Slot f a = Slot
-  { slotCall :: a -> f ()
-  , slotDead :: IO Bool
+data Signal f a = SignalNever | Signal
+  { signalSlots :: IORef [(IO Bool, a -> f ())]
   }
+      
+signalNever :: Signal f a
+signalNever = SignalNever
 
-slotForever :: (a -> f ()) -> Slot f a
-slotForever f = Slot f (return False)
+signalEmit :: MonadIO f => Signal f a -> a -> f ()
+signalEmit SignalNever _ = return ()
+signalEmit s@(Signal slots) v
+  = liftIO (readIORef slots) >>= F.mapM_ (`snd` v)
 
-slotForIORef :: MonadIO f => IORef b -> ((b -> IO ()) -> a -> f ()) -> IO (Slot f a)
-slotForIORef ref f = do
-  weakRef <- mkWeakIORef ref (return ())
-  let handler v = do
-        ref' <- liftIO $ deRefWeak weakRef
-        maybe (return ()) (flip f v . writeIORef) ref'
-  return $ Slot handler $ isNothing <$> deRefWeak weakRef
+signalConnect :: Signal f a -> (a -> f ()) -> IO (IO ())
+signalConnect SignalNever _ = return (return ())
+signalConnect s@(Signal slots) call = do
+  isAlive <- newIORef True
+  signalPrune s
+  writeIORef isAlive False <$ modifyIORef slots ((readIORef isAlive, call) :)
 
-data Signal f a = Signal
-  { signalTrigger :: a -> f ()
-  , signalConnect :: Slot f a -> IO ()
-  , signalPrune   :: IO ()
-  }
+signalPrune :: Signal f a -> IO ()
+signalPrune SignalNever = return ()
+signalPrune (Signal slots) = do
+  s <- readIORef slots
+  go s >>= writeIORef slots
+ where
+  go [] = return []
+  go (x@(a,_):xs) = do
+    b <- a
+    if b
+      then (x:) <$> go xs
+      else go xs
 
-signalNever :: Applicative f => Signal f a
-signalNever = Signal (\_ -> pure ()) (\_ -> pure ()) (pure ())
+signalReset :: Signal f a -> IO ()
+signalReset SignalNever = return ()
+signalReset (Signal slots) = writeIORef slots []
 
-signalCreate :: MonadIO f => IO (Signal f a)
-signalCreate = do
-  slots <- newIORef []
-  pure $ Signal
-    { signalTrigger = \v -> liftIO (readIORef slots) >>= F.mapM_ (flip slotCall v)
-    , signalConnect = modifyIORef slots . (:)
-    , signalPrune   = readIORef slots >>= filterM (fmap not . slotDead) >>= writeIORef slots
-    }
+signalCreate :: IO (Signal f a)
+signalCreate = Signal <$> newIORef []
